@@ -1,0 +1,17 @@
+services:
+  axs-scraper:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: axs_scraper
+    shm_size: 2gb
+    environment:
+      - PYTHONUNBUFFERED=1
+      - TARGET_URL=https://shop.axs.com/?c=axs&e=6414022407626854
+      - HEADLESS=True
+      - PROXY_FILE=test_data/iproyal-proxies (1).txt
+    volumes:
+      - ./output/screenshots:/app/output/screenshots
+      - ./output/logs:/app/output/logs
+      - ./test_data:/app/test_data:ro
+    restart: "no"

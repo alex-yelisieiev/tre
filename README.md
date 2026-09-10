@@ -137,6 +137,7 @@ tre/
 ├── docker-entrypoint.sh   # Starts Xvfb then runs python -m src.scraper
 ├── requirements.txt
 ├── .env.example
+├── .gitignore
 ├── .dockerignore
 └── README.md
 ```

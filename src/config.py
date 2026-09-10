@@ -1,63 +1,83 @@
-"""
-Configuration loader.
-
-All settings are read from environment variables (set in docker-compose.yml,
-a .env file, or the shell). Defaults are chosen so the service works
-out-of-the-box with the supplied IPRoyal proxies.
-"""
 from __future__ import annotations
 
 import os
+from dataclasses import dataclass
 from pathlib import Path
-from typing import List
+from typing import Optional
 
 
-def _bool(val: str, default: bool = True) -> bool:
-    return val.strip().lower() not in ("0", "false", "no", "off") if val else default
+def _load_dotenv_if_present(path: Path) -> None:
+    if not path.exists():
+        return
+    for line in path.read_text(encoding="utf-8").splitlines():
+        trimmed = line.strip()
+        if not trimmed or trimmed.startswith("#") or "=" not in trimmed:
+            continue
+        key, _, val = trimmed.partition("=")
+        key = key.strip()
+        val = val.strip().strip("'\"")
+        os.environ.setdefault(key, val)
 
 
-def _int(val: str, default: int) -> int:
+def _parse_bool(value: Optional[str], default: bool = True) -> bool:
+    if value is None:
+        return default
+    return value.strip().lower() not in {"0", "false", "no", "off"}
+
+
+def _parse_int(value: Optional[str], default: int) -> int:
+    if value is None:
+        return default
     try:
-        return int(val)
-    except (TypeError, ValueError):
+        return int(value.strip())
+    except ValueError:
         return default
 
 
-# ── Target URLs ──────────────────────────────────────────────────────────────
-_DEFAULT_URLS = (
-    "https://shop.axs.com/?c=axs&e=6414022407626854,"
-    "https://shop.axs.com/?c=axs&e=4436620017755968"
-)
-TARGET_URLS: List[str] = [
-    u.strip()
-    for u in os.getenv("TARGET_URLS", _DEFAULT_URLS).split(",")
-    if u.strip()
-]
+@dataclass(frozen=True)
+class Config:
+    target_urls: tuple[str, ...]
+    proxy_file: Path
+    proxy_type: str
+    action: str
+    output_dir: Path
+    headless: bool
+    humanize: bool
+    geoip: bool
+    page_timeout_ms: int
+    cf_wait_timeout_ms: int
+    max_retries: int
+    license_key: Optional[str]
 
-# ── Proxy ─────────────────────────────────────────────────────────────────────
-PROXY_FILE: Path = Path(os.getenv("PROXY_FILE", "proxies.txt"))
-PROXY_TYPE: str = os.getenv("PROXY_TYPE", "http").lower()  # http | https | socks5
+    @classmethod
+    def from_env(cls, env_file: Optional[Path] = None) -> Config:
+        target_env = env_file or Path(".env")
+        _load_dotenv_if_present(target_env)
 
-# ── Action ────────────────────────────────────────────────────────────────────
-# "screenshot"  – take a screenshot of the loaded page
-# "add_to_cart" – attempt to add a ticket to the cart
-# "both"        – do both (default)
-ACTION: str = os.getenv("ACTION", "both").lower()
+        default_urls = (
+            "https://shop.axs.com/?c=axs&e=6414022407626854",
+            "https://shop.axs.com/?c=axs&e=4436620017755968",
+        )
+        env_urls = os.getenv("TARGET_URLS")
+        if env_urls:
+            urls = tuple(u.strip() for u in env_urls.split(",") if u.strip())
+        else:
+            urls = default_urls
 
-# ── Output ────────────────────────────────────────────────────────────────────
-OUTPUT_DIR: Path = Path(os.getenv("OUTPUT_DIR", "output"))
-OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+        output_dir = Path(os.getenv("OUTPUT_DIR", "output"))
+        output_dir.mkdir(parents=True, exist_ok=True)
 
-# ── Browser ───────────────────────────────────────────────────────────────────
-HEADLESS: bool = _bool(os.getenv("HEADLESS", "true"))
-HUMANIZE: bool = _bool(os.getenv("HUMANIZE", "true"))
-GEOIP: bool = _bool(os.getenv("GEOIP", "true"))
-PAGE_TIMEOUT: int = _int(os.getenv("PAGE_TIMEOUT", "60000"), 60_000)   # ms
-
-# ── Retry ─────────────────────────────────────────────────────────────────────
-MAX_RETRIES: int = _int(os.getenv("MAX_RETRIES", "3"), 3)
-
-# ── CloakBrowser license (Pro) ────────────────────────────────────────────────
-# Set CLOAKBROWSER_LICENSE_KEY in the environment or .env file.
-# If unset, the free build (Chromium 146 from GitHub Releases) is used.
-LICENSE_KEY: str | None = os.getenv("CLOAKBROWSER_LICENSE_KEY") or None
+        return cls(
+            target_urls=urls,
+            proxy_file=Path(os.getenv("PROXY_FILE", "proxies.txt")),
+            proxy_type=os.getenv("PROXY_TYPE", "http").lower(),
+            action=os.getenv("ACTION", "both").lower(),
+            output_dir=output_dir,
+            headless=_parse_bool(os.getenv("HEADLESS"), default=False),
+            humanize=_parse_bool(os.getenv("HUMANIZE"), default=True),
+            geoip=_parse_bool(os.getenv("GEOIP"), default=True),
+            page_timeout_ms=_parse_int(os.getenv("PAGE_TIMEOUT"), 60_000),
+            cf_wait_timeout_ms=_parse_int(os.getenv("CF_WAIT_TIMEOUT"), 90) * 1000,
+            max_retries=_parse_int(os.getenv("MAX_RETRIES"), 3),
+            license_key=os.getenv("CLOAKBROWSER_LICENSE_KEY") or None,
+        )

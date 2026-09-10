@@ -1,224 +1,167 @@
-import random
+from __future__ import annotations
+
+import logging
+import os
 import re
-import string
-import tempfile
-from dataclasses import dataclass
+import threading
+import time
 from pathlib import Path
-from typing import List, Optional
-import httpx
+from typing import Dict, List, Optional, Protocol
+from urllib.parse import urlparse
+
+import requests
+
+log = logging.getLogger(__name__)
+
+VALIDATE_TIMEOUT = 5
+VALIDATE_URL = "https://api.ipify.org"
+CACHE_TTL = 600
 
 
-@dataclass
-class ProxyInfo:
-    protocol: str
-    host: str
-    port: int
-    username: Optional[str] = None
-    password: Optional[str] = None
-    session_id: Optional[str] = None
+class ProxyProvider(Protocol):
+    def get_next(self, validate: bool = True) -> Optional[str]:
+        ...
+
+    def mark_failed(self, proxy_url: str) -> None:
+        ...
 
     @property
-    def http_url(self) -> str:
-        if self.username and self.password:
-            return f"{self.protocol}://{self.username}:{self.password}@{self.host}:{self.port}"
-        return f"{self.protocol}://{self.host}:{self.port}"
+    def count(self) -> int:
+        ...
 
-    @property
-    def server_address(self) -> str:
-        return f"{self.host}:{self.port}"
+
+def parse_proxy_line(line: str, default_scheme: str = "http") -> Optional[str]:
+    cleaned = line.strip()
+    if not cleaned or cleaned.startswith("#"):
+        return None
+
+    if re.match(r"^(http|https|socks5)://", cleaned):
+        return cleaned
+
+    return f"{default_scheme}://{cleaned}"
+
+
+def build_requests_proxies(proxy_url: str) -> dict[str, str]:
+    parsed = urlparse(proxy_url)
+    scheme = parsed.scheme
+
+    if scheme in {"http", "https"}:
+        return {"http": proxy_url, "https": proxy_url}
+
+    if scheme == "socks5":
+        socks_url = proxy_url.replace("socks5://", "socks5h://", 1)
+        return {"http": socks_url, "https": socks_url}
+
+    return {}
+
+
+def validate_proxy(proxy_url: str, timeout: int = VALIDATE_TIMEOUT) -> bool:
+    proxies = build_requests_proxies(proxy_url)
+    try:
+        response = requests.get(VALIDATE_URL, proxies=proxies, timeout=timeout)
+        return response.status_code == 200
+    except Exception as exc:
+        log.debug("Validation failed for %s: %s", proxy_url, exc)
+        return False
 
 
 class ProxyManager:
-    def __init__(
-        self,
-        proxy_file: Optional[Path] = None,
-        single_proxy: Optional[str] = None,
-        timeout: float = 12.0,
-        validation_url: str = "https://api.ipify.org?format=json",
-    ):
-        self.proxy_file = proxy_file
-        self.single_proxy = single_proxy
-        self.timeout = timeout
-        self.validation_url = validation_url
-        self.proxies: List[ProxyInfo] = []
-        self.current_index: int = 0
+    def __init__(self, proxy_file: Path, default_scheme: str = "http") -> None:
+        self._file = proxy_file
+        self._scheme = default_scheme
+        self._lock = threading.Lock()
+        self._proxies: List[str] = []
+        self._index: int = 0
+        self._last_mtime: float = 0.0
+        self._validated_cache: Dict[str, float] = {}
+        self._load()
 
-        self._load_proxies()
+    @property
+    def count(self) -> int:
+        with self._lock:
+            return len(self._proxies)
 
-    def _load_proxies(self) -> None:
-        if self.single_proxy:
-            parsed = self._parse_proxy_string(self.single_proxy)
-            if parsed:
-                self.proxies.append(parsed)
-            return
+    def get_next(self, validate: bool = True) -> Optional[str]:
+        self._reload_if_modified()
 
-        if self.proxy_file and self.proxy_file.exists():
-            with open(self.proxy_file, "r", encoding="utf-8") as f:
-                for line in f:
-                    line = line.strip()
-                    if not line or line.startswith("#"):
-                        continue
-                    parsed = self._parse_proxy_string(line)
-                    if parsed:
-                        self.proxies.append(parsed)
+        with self._lock:
+            if not self._proxies:
+                return None
 
-    @staticmethod
-    def _parse_proxy_string(raw: str) -> Optional[ProxyInfo]:
-        protocol = "http"
-        if "://" in raw:
-            protocol, raw = raw.split("://", 1)
-            protocol = protocol.lower()
+            candidates_count = len(self._proxies)
+            for _ in range(candidates_count):
+                proxy = self._proxies[self._index % len(self._proxies)]
+                self._index += 1
 
-        # Format: username:password@host:port
-        auth_match = re.match(r"^([^:]+):([^@]+)@([^:]+):(\d+)$", raw)
-        if auth_match:
-            user, password, host, port = auth_match.groups()
-            session_match = re.search(r"session-([A-Za-z0-9]+)", password)
-            session_id = session_match.group(1) if session_match else None
-            return ProxyInfo(
-                protocol=protocol,
-                host=host,
-                port=int(port),
-                username=user,
-                password=password,
-                session_id=session_id,
-            )
+                if not validate or self._is_cache_valid(proxy):
+                    return proxy
 
-        # Format: host:port:username:password
-        hpupp_match = re.match(r"^([^:]+):(\d+):([^:]+):(.+)$", raw)
-        if hpupp_match:
-            host, port, user, password = hpupp_match.groups()
-            return ProxyInfo(
-                protocol=protocol,
-                host=host,
-                port=int(port),
-                username=user,
-                password=password,
-            )
+                log.info("Validating proxy before use: %s", proxy)
+                if validate_proxy(proxy):
+                    self._validated_cache[proxy] = time.monotonic()
+                    log.info("Proxy validated successfully")
+                    return proxy
 
-        # Format: host:port
-        hp_match = re.match(r"^([^:]+):(\d+)$", raw)
-        if hp_match:
-            host, port = hp_match.groups()
-            return ProxyInfo(
-                protocol=protocol,
-                host=host,
-                port=int(port),
-            )
+                log.warning("Proxy validation failed, evicting: %s", proxy)
+                try:
+                    self._proxies.remove(proxy)
+                except ValueError:
+                    pass
 
-        return None
+            return None
 
-    def renew_sticky_session(self, proxy: ProxyInfo) -> ProxyInfo:
-        if not proxy.password or "session-" not in proxy.password:
-            return proxy
+    def mark_failed(self, proxy_url: str) -> None:
+        with self._lock:
+            try:
+                self._proxies.remove(proxy_url)
+                self._validated_cache.pop(proxy_url, None)
+                log.warning("Removed failed proxy: %s (%d remaining)", proxy_url, len(self._proxies))
+            except ValueError:
+                pass
 
-        chars = string.ascii_letters + string.digits
-        new_session = "".join(random.choices(chars, k=8))
-        new_password = re.sub(
-            r"session-[A-Za-z0-9]+", f"session-{new_session}", proxy.password
-        )
-        return ProxyInfo(
-            protocol=proxy.protocol,
-            host=proxy.host,
-            port=proxy.port,
-            username=proxy.username,
-            password=new_password,
-            session_id=new_session,
-        )
+    def reload(self) -> None:
+        with self._lock:
+            self._load()
 
-    async def validate_proxy(self, proxy: ProxyInfo) -> Optional[dict]:
+    def _is_cache_valid(self, proxy: str) -> bool:
+        last_validated = self._validated_cache.get(proxy)
+        if last_validated is None:
+            return False
+        return (time.monotonic() - last_validated) < CACHE_TTL
+
+    def _reload_if_modified(self) -> None:
         try:
-            async with httpx.AsyncClient(
-                proxy=proxy.http_url, timeout=self.timeout
-            ) as client:
-                resp = await client.get(self.validation_url)
-                if resp.status_code == 200:
-                    data = resp.json()
-                    return {
-                        "ip": data.get("ip"),
-                        "session": proxy.session_id,
-                        "valid": True,
-                    }
-        except Exception:
-            return None
-        return None
+            if self._file.exists():
+                mtime = self._file.stat().st_mtime
+                if mtime > self._last_mtime:
+                    log.info("Proxy file updated on disk, reloading")
+                    with self._lock:
+                        self._load()
+        except Exception as exc:
+            log.debug("Error checking proxy file update: %s", exc)
 
-    async def get_working_proxy(self) -> ProxyInfo:
-        if not self.proxies:
-            raise RuntimeError("No proxies available in configuration")
+    def _load(self) -> None:
+        candidates: List[str] = []
 
-        attempts = min(len(self.proxies) * 2, 10)
-        for _ in range(attempts):
-            proxy = self.proxies[self.current_index % len(self.proxies)]
-            self.current_index += 1
+        env_proxies = os.getenv("PROXIES") or os.getenv("PROXY_URL", "")
+        if env_proxies:
+            for entry in re.split(r"[\n,;]+", env_proxies):
+                parsed = parse_proxy_line(entry, self._scheme)
+                if parsed and parsed not in candidates:
+                    candidates.append(parsed)
 
-            result = await self.validate_proxy(proxy)
-            if result:
-                return proxy
+        if self._file.exists():
+            try:
+                self._last_mtime = self._file.stat().st_mtime
+                for line in self._file.read_text(encoding="utf-8").splitlines():
+                    parsed = parse_proxy_line(line, self._scheme)
+                    if parsed and parsed not in candidates:
+                        candidates.append(parsed)
+            except Exception as exc:
+                log.warning("Failed to read proxy file %s: %s", self._file, exc)
+        elif not candidates:
+            log.warning("Proxy file not found (%s) and no PROXIES env var provided", self._file)
 
-            # If failed, try regenerating session for sticky proxies
-            if proxy.session_id:
-                refreshed = self.renew_sticky_session(proxy)
-                result = await self.validate_proxy(refreshed)
-                if result:
-                    return refreshed
-
-        raise RuntimeError("Failed to find a responsive proxy after multiple checks")
-
-    @staticmethod
-    def create_auth_extension(proxy: ProxyInfo) -> Optional[Path]:
-        if not (proxy.username and proxy.password):
-            return None
-
-        ext_dir = Path(tempfile.mkdtemp(prefix="proxy_auth_ext_"))
-        manifest_path = ext_dir / "manifest.json"
-        background_path = ext_dir / "background.js"
-
-        manifest_content = """{
-    "version": "1.0.0",
-    "manifest_version": 2,
-    "name": "Chrome Proxy Authentication",
-    "permissions": [
-        "proxy",
-        "tabs",
-        "unlimitedStorage",
-        "*://*/*",
-        "<all_urls>",
-        "webRequest",
-        "webRequestBlocking"
-    ],
-    "background": {
-        "scripts": ["background.js"]
-    },
-    "minimum_chrome_version": "76.0.0"
-}"""
-        background_content = f"""
-var config = {{
-    mode: "fixed_servers",
-    rules: {{
-        singleProxy: {{
-            scheme: "{proxy.protocol}",
-            host: "{proxy.host}",
-            port: parseInt({proxy.port})
-        }},
-        bypassList: ["localhost", "127.0.0.1"]
-    }}
-}};
-chrome.proxy.settings.set({{value: config, scope: "regular"}}, function() {{}});
-function callbackFn(details) {{
-    return {{
-        authCredentials: {{
-            username: "{proxy.username}",
-            password: "{proxy.password}"
-        }}
-    }};
-}}
-chrome.webRequest.onAuthRequired.addListener(
-    callbackFn,
-    {{urls: ["<all_urls>"]}},
-    ['blocking']
-);
-"""
-        manifest_path.write_text(manifest_content, encoding="utf-8")
-        background_path.write_text(background_content, encoding="utf-8")
-        return ext_dir
+        log.info("Loaded %d proxies (file=%s)", len(candidates), self._file)
+        self._proxies = candidates
+        self._index = 0

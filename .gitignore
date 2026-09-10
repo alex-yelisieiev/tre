@@ -1,6 +1,10 @@
 # Output artifacts (screenshots, results, logs)
 output/
 
+# Test data & proxy credentials
+test_data/
+proxies.txt
+
 # Environment files
 .env
 

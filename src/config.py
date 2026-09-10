@@ -1,39 +1,63 @@
+"""
+Configuration loader.
+
+All settings are read from environment variables (set in docker-compose.yml,
+a .env file, or the shell). Defaults are chosen so the service works
+out-of-the-box with the supplied IPRoyal proxies.
+"""
+from __future__ import annotations
+
+import os
 from pathlib import Path
-from typing import Optional
-from pydantic_settings import BaseSettings, SettingsConfigDict
+from typing import List
 
 
-class Settings(BaseSettings):
-    model_config = SettingsConfigDict(
-        env_file=".env",
-        env_file_encoding="utf-8",
-        extra="ignore",
-    )
-
-    # Scraping Targets
-    target_url: str = "https://shop.axs.com/?c=axs&e=6414022407626854"
-    secondary_url: str = "https://shop.axs.com/?c=axs&e=4436620017755968"
-
-    # Proxy Configuration
-    proxy_file: Path = Path("test_data/iproyal-proxies (1).txt")
-    single_proxy: Optional[str] = None
-    proxy_timeout: float = 12.0
-    proxy_validation_url: str = "https://api.ipify.org?format=json"
-
-    # Browser & Anti-detect
-    headless: bool = True
-    browser_executable_path: Optional[str] = None
-    navigation_timeout: int = 60
-    challenge_timeout: int = 35
-    max_retries: int = 3
-
-    # Output Paths
-    screenshot_dir: Path = Path("output/screenshots")
-    log_dir: Path = Path("output/logs")
-
-    def ensure_dirs(self) -> None:
-        self.screenshot_dir.mkdir(parents=True, exist_ok=True)
-        self.log_dir.mkdir(parents=True, exist_ok=True)
+def _bool(val: str, default: bool = True) -> bool:
+    return val.strip().lower() not in ("0", "false", "no", "off") if val else default
 
 
-settings = Settings()
+def _int(val: str, default: int) -> int:
+    try:
+        return int(val)
+    except (TypeError, ValueError):
+        return default
+
+
+# ── Target URLs ──────────────────────────────────────────────────────────────
+_DEFAULT_URLS = (
+    "https://shop.axs.com/?c=axs&e=6414022407626854,"
+    "https://shop.axs.com/?c=axs&e=4436620017755968"
+)
+TARGET_URLS: List[str] = [
+    u.strip()
+    for u in os.getenv("TARGET_URLS", _DEFAULT_URLS).split(",")
+    if u.strip()
+]
+
+# ── Proxy ─────────────────────────────────────────────────────────────────────
+PROXY_FILE: Path = Path(os.getenv("PROXY_FILE", "proxies.txt"))
+PROXY_TYPE: str = os.getenv("PROXY_TYPE", "http").lower()  # http | https | socks5
+
+# ── Action ────────────────────────────────────────────────────────────────────
+# "screenshot"  – take a screenshot of the loaded page
+# "add_to_cart" – attempt to add a ticket to the cart
+# "both"        – do both (default)
+ACTION: str = os.getenv("ACTION", "both").lower()
+
+# ── Output ────────────────────────────────────────────────────────────────────
+OUTPUT_DIR: Path = Path(os.getenv("OUTPUT_DIR", "output"))
+OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+
+# ── Browser ───────────────────────────────────────────────────────────────────
+HEADLESS: bool = _bool(os.getenv("HEADLESS", "true"))
+HUMANIZE: bool = _bool(os.getenv("HUMANIZE", "true"))
+GEOIP: bool = _bool(os.getenv("GEOIP", "true"))
+PAGE_TIMEOUT: int = _int(os.getenv("PAGE_TIMEOUT", "60000"), 60_000)   # ms
+
+# ── Retry ─────────────────────────────────────────────────────────────────────
+MAX_RETRIES: int = _int(os.getenv("MAX_RETRIES", "3"), 3)
+
+# ── CloakBrowser license (Pro) ────────────────────────────────────────────────
+# Set CLOAKBROWSER_LICENSE_KEY in the environment or .env file.
+# If unset, the free build (Chromium 146 from GitHub Releases) is used.
+LICENSE_KEY: str | None = os.getenv("CLOAKBROWSER_LICENSE_KEY") or None

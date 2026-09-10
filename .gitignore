@@ -1,8 +1,18 @@
+# Output artifacts (screenshots, results, logs)
+output/
+
+# Environment files
+.env
+
+# Python
 __pycache__/
 *.py[cod]
 *$py.class
 *.so
 .Python
+env/
+venv/
+.venv/
 build/
 develop-eggs/
 dist/
@@ -19,18 +29,12 @@ wheels/
 .installed.cfg
 *.egg
 
-# Virtual environments
-.env
-.venv
-env/
-venv/
-ENV/
-
-# Output directories & artifacts
-output/
-*.log
-
-# IDE & OS files
+# IDE / OS
 .DS_Store
-.vscode/
 .idea/
+.vscode/
+*.swp
+*.swo
+
+# CloakBrowser cache
+.cache/
